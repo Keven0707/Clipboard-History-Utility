@@ -22,8 +22,5 @@
 
 双击 启动拾贴.cmd。首次运行会自动构建，然后打开程序。
 
-也可以在 PowerShell 中手动构建：
-
-powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1
-
-构建结果位于 dist\QuietClip.exe。项目直接使用 Windows 自带的 .NET Framework 4.x 编译器，无需下载依赖。
+更新：
+刚刚发现微信输入法自带剪贴板功能，轻度使用需求的用户也可以使用微信输入法
