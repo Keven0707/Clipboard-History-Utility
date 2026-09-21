@@ -18,6 +18,23 @@ namespace QuietClip
         [DataMember(Order = 3)]
         public long CapturedAtUtcTicks { get; set; }
 
+        [DataMember(Order = 4)]
+        public string ContentKind { get; set; }
+
+        [DataMember(Order = 5)]
+        public string ImagePngBase64 { get; set; }
+
+        [DataMember(Order = 6)]
+        public int ImageWidth { get; set; }
+
+        [DataMember(Order = 7)]
+        public int ImageHeight { get; set; }
+
+        public bool IsImage
+        {
+            get { return String.Equals(ContentKind, "image", StringComparison.Ordinal); }
+        }
+
         public DateTime CapturedAtLocal
         {
             get
@@ -39,7 +56,11 @@ namespace QuietClip
             {
                 Id = Id,
                 Text = Text,
-                CapturedAtUtcTicks = CapturedAtUtcTicks
+                CapturedAtUtcTicks = CapturedAtUtcTicks,
+                ContentKind = ContentKind,
+                ImagePngBase64 = ImagePngBase64,
+                ImageWidth = ImageWidth,
+                ImageHeight = ImageHeight
             };
         }
     }
@@ -74,6 +95,9 @@ namespace QuietClip
         [DataMember(Order = 9)]
         public string ThemeName { get; set; }
 
+        [DataMember(Order = 10)]
+        public bool AlwaysOnTop { get; set; }
+
         public static AppState CreateDefault()
         {
             return new AppState
@@ -86,7 +110,8 @@ namespace QuietClip
                 WindowX = -1,
                 WindowY = -1,
                 Items = new List<ClipEntry>(),
-                ThemeName = "银河紫"
+                ThemeName = "银河紫",
+                AlwaysOnTop = false
             };
         }
 
@@ -109,8 +134,19 @@ namespace QuietClip
 
             Items.RemoveAll(delegate(ClipEntry item)
             {
-                return item == null || String.IsNullOrWhiteSpace(item.Text);
+                return item == null || (item.IsImage ? String.IsNullOrWhiteSpace(item.ImagePngBase64) :
+                    String.IsNullOrWhiteSpace(item.Text));
             });
+
+            HashSet<string> entryIds = new HashSet<string>(StringComparer.Ordinal);
+            foreach (ClipEntry item in Items)
+            {
+                if (String.IsNullOrWhiteSpace(item.Id) || !entryIds.Add(item.Id))
+                {
+                    item.Id = Guid.NewGuid().ToString("N");
+                    entryIds.Add(item.Id);
+                }
+            }
 
             if (Items.Count > MaxItems)
                 Items.RemoveRange(MaxItems, Items.Count - MaxItems);

@@ -2,6 +2,8 @@ using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.Drawing.Imaging;
+using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -14,6 +16,8 @@ namespace QuietClip
     {
         private const int HotkeyId = 0x4A21;
         private const int MaxClipboardCharacters = 1000000;
+        private const int MaxClipboardImageDimension = 4096;
+        private const int MaxClipboardImageBytes = 8 * 1024 * 1024;
         private const int ResizeGrip = 7;
 
         private readonly AppState _state;
@@ -28,6 +32,7 @@ namespace QuietClip
         private readonly Label _hotkeyHint;
         private readonly RoundButton _copyAllButton;
         private readonly RoundButton _clearButton;
+        private readonly RoundButton _pinButton;
         private readonly RoundButton _settingsButton;
         private readonly RoundButton _hotkeyRecorder;
         private readonly RoundButton _colorPicker;
@@ -37,6 +42,8 @@ namespace QuietClip
         private readonly Timer _statusTimer;
         private readonly NotifyIcon _trayIcon;
         private readonly ContextMenuStrip _colorMenu;
+        private readonly ToolTip _headerToolTip;
+        private readonly HashSet<string> _selectedEntryIds;
         private Icon _applicationIcon;
 
         private bool _settingsVisible;
@@ -48,6 +55,7 @@ namespace QuietClip
         private bool _clipboardListenerRegistered;
         private int _clipboardRetryCount;
         private string _suppressedClipboardText;
+        private string _suppressedClipboardImageData;
         private uint _registeredModifiers;
         private Keys _registeredKey;
         private List<ClipEntry> _undoBuffer;
@@ -56,6 +64,11 @@ namespace QuietClip
         public MainForm()
         {
             _state = StateStore.Load();
+            _selectedEntryIds = new HashSet<string>(StringComparer.Ordinal);
+            _headerToolTip = new ToolTip();
+            _headerToolTip.InitialDelay = 250;
+            _headerToolTip.ReshowDelay = 100;
+            _headerToolTip.AutoPopDelay = 3000;
             Theme.Apply(_state.ThemeName);
             _applicationIcon = CreateApplicationIcon();
 
@@ -69,6 +82,7 @@ namespace QuietClip
             Padding = new Padding(1);
             KeyPreview = true;
             AutoScaleMode = AutoScaleMode.Dpi;
+            TopMost = _state.AlwaysOnTop;
 
             RestoreWindowPosition();
 
@@ -86,7 +100,7 @@ namespace QuietClip
             _root.RowStyles.Add(new RowStyle(SizeType.Absolute, 34F));
             Controls.Add(_root);
 
-            _header = BuildHeader(out _countLabel, out _settingsButton);
+            _header = BuildHeader(out _countLabel, out _pinButton, out _settingsButton);
             _toolbar = BuildToolbar(out _copyAllButton, out _clearButton);
             _settingsPanel = BuildSettings(out _maxItemsInput, out _hotkeyRecorder, out _colorPicker);
             _colorMenu = BuildColorMenu();
@@ -100,8 +114,9 @@ namespace QuietClip
             _root.Controls.Add(_footer, 0, 4);
 
             _settingsButton.Click += delegate { ToggleSettings(); };
-            _copyAllButton.Click += delegate { CopyAllItems(); };
-            _clearButton.Click += delegate { ClearHistory(); };
+            _pinButton.Click += delegate { ToggleAlwaysOnTop(); };
+            _copyAllButton.Click += delegate { CopyPrimaryItems(); };
+            _clearButton.Click += delegate { DeletePrimaryItems(); };
             _statusActionButton.Click += delegate
             {
                 Action action = _statusAction;
@@ -128,7 +143,7 @@ namespace QuietClip
             _clipboardRetryTimer.Tick += delegate
             {
                 _clipboardRetryTimer.Stop();
-                CaptureClipboardText();
+                CaptureClipboardContent();
             };
 
             _statusTimer = new Timer();
@@ -151,6 +166,7 @@ namespace QuietClip
             };
 
             LoadSettingsControls();
+            UpdatePinButtonAppearance();
             RefreshHistoryView();
             UpdateWindowChrome();
         }
@@ -216,7 +232,7 @@ namespace QuietClip
             if (m.Msg == NativeMethods.WM_CLIPBOARDUPDATE)
             {
                 _clipboardRetryCount = 0;
-                BeginInvoke(new Action(CaptureClipboardText));
+                BeginInvoke(new Action(CaptureClipboardContent));
             }
             else if (m.Msg == NativeMethods.WM_HOTKEY && m.WParam.ToInt32() == HotkeyId)
             {
@@ -225,7 +241,8 @@ namespace QuietClip
             base.WndProc(ref m);
         }
 
-        private Panel BuildHeader(out BadgeLabel countLabel, out RoundButton settingsButton)
+        private Panel BuildHeader(out BadgeLabel countLabel, out RoundButton pinButton,
+            out RoundButton settingsButton)
         {
             Panel panel = new Panel();
             panel.Dock = DockStyle.Fill;
@@ -264,16 +281,30 @@ namespace QuietClip
             countLabel.AccessibleName = "当前历史条数";
             panel.Controls.Add(countLabel);
 
+            pinButton = new RoundButton();
+            pinButton.Icon = RoundButtonIcon.Pin;
+            pinButton.Size = new Size(32, 30);
+            pinButton.NormalColor = Theme.Paper;
+            pinButton.HoverColor = Theme.AccentSoft;
+            pinButton.PressedColor = Theme.AccentSoftPressed;
+            pinButton.TextColor = Theme.Muted;
+            pinButton.BorderColor = Theme.Faint;
+            pinButton.Font = Theme.Font(8F, FontStyle.Regular);
+            pinButton.AccessibleName = "开启窗口置顶";
+            _headerToolTip.SetToolTip(pinButton, "置顶");
+            panel.Controls.Add(pinButton);
+
             settingsButton = new RoundButton();
-            settingsButton.Text = "设置";
-            settingsButton.Size = new Size(52, 28);
+            settingsButton.Icon = RoundButtonIcon.Settings;
+            settingsButton.Size = new Size(32, 30);
             settingsButton.NormalColor = Theme.Paper;
             settingsButton.HoverColor = Theme.AccentSoft;
             settingsButton.PressedColor = Theme.AccentSoftPressed;
-            settingsButton.TextColor = Theme.Ink;
+            settingsButton.TextColor = Theme.Muted;
             settingsButton.BorderColor = Theme.Faint;
             settingsButton.Font = Theme.Font(8F, FontStyle.Regular);
             settingsButton.AccessibleName = "打开设置";
+            _headerToolTip.SetToolTip(settingsButton, "设置");
             panel.Controls.Add(settingsButton);
 
             RoundButton minimizeButton = BuildWindowButton("—", "隐藏到系统托盘");
@@ -310,13 +341,16 @@ namespace QuietClip
             title.DoubleClick += maximizeHandler;
 
             BadgeLabel countForLayout = countLabel;
+            RoundButton pinForLayout = pinButton;
             RoundButton settingsForLayout = settingsButton;
             panel.Resize += delegate
             {
                 closeButton.SetBounds(panel.ClientSize.Width - 39, 7, 32, 30);
                 minimizeButton.SetBounds(panel.ClientSize.Width - 75, 7, 32, 30);
-                settingsForLayout.Location = new Point(panel.ClientSize.Width - 133, 8);
-                countForLayout.Location = new Point(panel.ClientSize.Width - 191, 9);
+                settingsForLayout.Location = new Point(panel.ClientSize.Width - 111, 7);
+                pinForLayout.Location = new Point(panel.ClientSize.Width - 147, 7);
+                countForLayout.Visible = panel.ClientSize.Width >= 380;
+                countForLayout.Location = new Point(panel.ClientSize.Width - 205, 9);
             };
 
             return panel;
@@ -517,6 +551,9 @@ namespace QuietClip
             _countLabel.TextColor = Theme.Accent;
             _settingsButton.HoverColor = Theme.AccentSoft;
             _settingsButton.PressedColor = Theme.AccentSoftPressed;
+            _settingsButton.TextColor = Theme.Muted;
+            _pinButton.HoverColor = Theme.AccentSoftHover;
+            _pinButton.PressedColor = Theme.AccentSoftPressed;
             _copyAllButton.NormalColor = Theme.Accent;
             _copyAllButton.HoverColor = Theme.AccentHover;
             _copyAllButton.PressedColor = Theme.AccentPressed;
@@ -534,11 +571,36 @@ namespace QuietClip
                 colorItem.Checked = String.Equals(colorItem.Tag as string, Theme.CurrentName, StringComparison.Ordinal);
 
             UpdateWindowButtonColors(_header);
+            UpdatePinButtonAppearance();
             RefreshApplicationIcon();
             RefreshHistoryView();
             _root.Invalidate(true);
             StateStore.Save(_state);
             ShowStatus("已切换为" + Theme.CurrentName, null, null);
+        }
+
+        private void ToggleAlwaysOnTop()
+        {
+            _state.AlwaysOnTop = !_state.AlwaysOnTop;
+            TopMost = _state.AlwaysOnTop;
+            UpdatePinButtonAppearance();
+            StateStore.Save(_state);
+            ShowStatus(_state.AlwaysOnTop ? "窗口已置顶" : "已取消窗口置顶", null, null);
+        }
+
+        private void UpdatePinButtonAppearance()
+        {
+            if (_pinButton == null)
+                return;
+
+            _pinButton.AccessibleName = _state.AlwaysOnTop ? "取消窗口置顶" : "开启窗口置顶";
+            _pinButton.NormalColor = _state.AlwaysOnTop ? Theme.AccentSoft : Theme.Paper;
+            _pinButton.HoverColor = Theme.AccentSoftHover;
+            _pinButton.PressedColor = Theme.AccentSoftPressed;
+            _pinButton.TextColor = _state.AlwaysOnTop ? Theme.Accent : Theme.Muted;
+            _pinButton.BorderColor = _state.AlwaysOnTop ? Theme.Accent : Theme.Faint;
+            _headerToolTip.SetToolTip(_pinButton, "置顶");
+            _pinButton.Invalidate();
         }
 
         private static void UpdateWindowButtonColors(Control parent)
@@ -734,8 +796,8 @@ namespace QuietClip
             _settingsVisible = !_settingsVisible;
             _root.RowStyles[2].Height = _settingsVisible ? 188F : 0F;
             _settingsPanel.Visible = _settingsVisible;
-            _settingsButton.Text = _settingsVisible ? "收起" : "设置";
             _settingsButton.AccessibleName = _settingsVisible ? "收起设置" : "打开设置";
+            _headerToolTip.SetToolTip(_settingsButton, _settingsVisible ? "收起设置" : "设置");
             if (!_settingsVisible && _heightBeforeSettings >= 340 && _heightBeforeSettings < Height)
                 Height = _heightBeforeSettings;
             LayoutHistoryItems();
@@ -944,10 +1006,16 @@ namespace QuietClip
             }
         }
 
-        private void CaptureClipboardText()
+        private void CaptureClipboardContent()
         {
             try
             {
+                if (Clipboard.ContainsImage())
+                {
+                    CaptureClipboardImage();
+                    return;
+                }
+
                 if (!Clipboard.ContainsText(TextDataFormat.UnicodeText))
                     return;
 
@@ -1001,12 +1069,115 @@ namespace QuietClip
             }
         }
 
+        private void CaptureClipboardImage()
+        {
+            using (Image image = Clipboard.GetImage())
+            {
+                if (image == null)
+                    return;
+                if (image.Width > MaxClipboardImageDimension || image.Height > MaxClipboardImageDimension)
+                {
+                    ShowStatus("图片边长超过 " + MaxClipboardImageDimension + " 像素，已跳过", null, null);
+                    return;
+                }
+
+                string imageData = EncodeImageAsPng(image);
+                if (String.IsNullOrEmpty(imageData))
+                {
+                    ShowStatus("图片过大或无法读取，未保存", null, null);
+                    return;
+                }
+
+                if (_suppressedClipboardImageData != null && String.Equals(imageData,
+                    _suppressedClipboardImageData, StringComparison.Ordinal))
+                {
+                    _suppressedClipboardImageData = null;
+                    return;
+                }
+                _suppressedClipboardImageData = null;
+
+                ClipEntry existing = _state.Items.FirstOrDefault(delegate(ClipEntry item)
+                {
+                    return item.IsImage && String.Equals(item.ImagePngBase64, imageData,
+                        StringComparison.Ordinal);
+                });
+                if (existing != null)
+                    _state.Items.Remove(existing);
+
+                _state.Items.Insert(0, new ClipEntry
+                {
+                    Id = Guid.NewGuid().ToString("N"),
+                    ContentKind = "image",
+                    ImagePngBase64 = imageData,
+                    ImageWidth = image.Width,
+                    ImageHeight = image.Height,
+                    CapturedAtUtcTicks = DateTime.UtcNow.Ticks
+                });
+
+                if (_state.Items.Count > _state.MaxItems)
+                    _state.Items.RemoveRange(_state.MaxItems, _state.Items.Count - _state.MaxItems);
+
+                _undoBuffer = null;
+                StateStore.Save(_state);
+                RefreshHistoryView();
+                ShowStatus("已收好一张图片", null, null);
+            }
+        }
+
         private void CopyEntry(ClipEntry entry)
         {
-            if (entry == null || String.IsNullOrEmpty(entry.Text))
+            if (entry == null)
                 return;
-            if (TrySetClipboardText(entry.Text))
+
+            if (entry.IsImage)
+            {
+                if (TrySetClipboardImage(entry.ImagePngBase64))
+                    ShowStatus("已复制这张图片", null, null);
+                else
+                    ShowStatus("图片无法复制，请再试一次", null, null);
+            }
+            else if (!String.IsNullOrEmpty(entry.Text) && TrySetClipboardText(entry.Text))
+            {
                 ShowStatus("已复制这一条", null, null);
+            }
+            else
+            {
+                ShowStatus("剪贴板正忙，请再试一次", null, null);
+            }
+        }
+
+        private void CopyPrimaryItems()
+        {
+            if (_selectedEntryIds.Count > 0)
+                CopySelectedItems();
+            else
+                CopyAllItems();
+        }
+
+        private void CopySelectedItems()
+        {
+            List<ClipEntry> selectedItems = GetSelectedEntriesInCurrentOrder();
+            if (selectedItems.Count == 0)
+            {
+                _selectedEntryIds.Clear();
+                UpdateToolbarState();
+                ShowStatus("请先勾选要复制的内容", null, null);
+                return;
+            }
+
+            if (selectedItems.Any(delegate(ClipEntry item) { return item.IsImage; }))
+            {
+                if (selectedItems.Count == 1)
+                    CopyEntry(selectedItems[0]);
+                else
+                    ShowStatus("图片请单独复制；可继续批量删除", null, null);
+                return;
+            }
+
+            string combined = String.Join(Environment.NewLine,
+                selectedItems.Select(delegate(ClipEntry item) { return item.Text; }).ToArray());
+            if (TrySetClipboardText(combined))
+                ShowStatus("已按当前顺序复制所选 " + selectedItems.Count + " 条", null, null);
             else
                 ShowStatus("剪贴板正忙，请再试一次", null, null);
         }
@@ -1019,10 +1190,24 @@ namespace QuietClip
                 return;
             }
 
+            List<ClipEntry> textItems = _state.Items.Where(delegate(ClipEntry item)
+            {
+                return !item.IsImage;
+            }).ToList();
+            if (textItems.Count == 0)
+            {
+                ShowStatus("当前都是图片，请单独复制", null, null);
+                return;
+            }
+
             string combined = String.Join(Environment.NewLine + Environment.NewLine,
-                _state.Items.Select(delegate(ClipEntry item) { return item.Text; }).ToArray());
+                textItems.Select(delegate(ClipEntry item) { return item.Text; }).ToArray());
             if (TrySetClipboardText(combined))
-                ShowStatus("已按当前顺序复制全部 " + _state.Items.Count + " 条", null, null);
+            {
+                int imageCount = _state.Items.Count - textItems.Count;
+                ShowStatus(imageCount == 0 ? "已按当前顺序复制全部 " + textItems.Count + " 条" :
+                    "已复制 " + textItems.Count + " 条文字，图片请单独复制", null, null);
+            }
             else
                 ShowStatus("剪贴板正忙，请再试一次", null, null);
         }
@@ -1046,6 +1231,107 @@ namespace QuietClip
             return false;
         }
 
+        private static string EncodeImageAsPng(Image image)
+        {
+            try
+            {
+                using (MemoryStream stream = new MemoryStream())
+                {
+                    image.Save(stream, ImageFormat.Png);
+                    if (stream.Length > MaxClipboardImageBytes)
+                        return null;
+                    return Convert.ToBase64String(stream.ToArray());
+                }
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private bool TrySetClipboardImage(string imagePngBase64)
+        {
+            if (String.IsNullOrWhiteSpace(imagePngBase64))
+                return false;
+
+            _suppressedClipboardImageData = imagePngBase64;
+            for (int attempt = 0; attempt < 3; attempt++)
+            {
+                try
+                {
+                    using (Image image = DecodePngImage(imagePngBase64))
+                    {
+                        if (image == null)
+                            break;
+                        Clipboard.SetImage(image);
+                        return true;
+                    }
+                }
+                catch (ExternalException)
+                {
+                    Thread.Sleep(20);
+                }
+            }
+            _suppressedClipboardImageData = null;
+            return false;
+        }
+
+        private static Image DecodePngImage(string imagePngBase64)
+        {
+            try
+            {
+                byte[] bytes = Convert.FromBase64String(imagePngBase64);
+                using (MemoryStream stream = new MemoryStream(bytes))
+                using (Image source = Image.FromStream(stream))
+                    return new Bitmap(source);
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private void DeletePrimaryItems()
+        {
+            if (_selectedEntryIds.Count > 0)
+                DeleteSelectedItems();
+            else
+                ClearHistory();
+        }
+
+        private void DeleteSelectedItems()
+        {
+            List<ClipEntry> selectedItems = GetSelectedEntriesInCurrentOrder();
+            if (selectedItems.Count == 0)
+            {
+                _selectedEntryIds.Clear();
+                UpdateToolbarState();
+                ShowStatus("请先勾选要删除的内容", null, null);
+                return;
+            }
+
+            _undoBuffer = _state.Items.Select(delegate(ClipEntry item) { return item.Clone(); }).ToList();
+            HashSet<string> selectedIds = new HashSet<string>(
+                selectedItems.Select(delegate(ClipEntry item) { return item.Id; }), StringComparer.Ordinal);
+            _state.Items.RemoveAll(delegate(ClipEntry item)
+            {
+                return item != null && selectedIds.Contains(item.Id);
+            });
+            _selectedEntryIds.Clear();
+            StateStore.Save(_state);
+            RefreshHistoryView();
+            ShowStatus("已删除所选 " + selectedItems.Count + " 条", "撤销", RestoreClearedHistory);
+        }
+
+        private List<ClipEntry> GetSelectedEntriesInCurrentOrder()
+        {
+            return _state.Items.Where(delegate(ClipEntry item)
+            {
+                return item != null && !String.IsNullOrEmpty(item.Id) &&
+                    _selectedEntryIds.Contains(item.Id);
+            }).ToList();
+        }
+
         private void ClearHistory()
         {
             if (_state.Items.Count == 0)
@@ -1057,6 +1343,7 @@ namespace QuietClip
             _undoBuffer = _state.Items.Select(delegate(ClipEntry item) { return item.Clone(); }).ToList();
             int removedCount = _undoBuffer.Count;
             _state.Items.Clear();
+            _selectedEntryIds.Clear();
             StateStore.Save(_state);
             RefreshHistoryView();
             ShowStatus("已清空 " + removedCount + " 条", "撤销", RestoreClearedHistory);
@@ -1070,6 +1357,7 @@ namespace QuietClip
             _state.Items = _undoBuffer.Take(_state.MaxItems)
                 .Select(delegate(ClipEntry item) { return item.Clone(); }).ToList();
             _undoBuffer = null;
+            _selectedEntryIds.Clear();
             StateStore.Save(_state);
             RefreshHistoryView();
             ShowStatus("已恢复", null, null);
@@ -1079,6 +1367,11 @@ namespace QuietClip
         {
             if (_historyPanel == null)
                 return;
+
+            HashSet<string> validIds = new HashSet<string>(_state.Items
+                .Where(delegate(ClipEntry item) { return item != null && !String.IsNullOrEmpty(item.Id); })
+                .Select(delegate(ClipEntry item) { return item.Id; }), StringComparer.Ordinal);
+            _selectedEntryIds.RemoveWhere(delegate(string id) { return !validIds.Contains(id); });
 
             _historyPanel.SuspendLayout();
             while (_historyPanel.Controls.Count > 0)
@@ -1093,10 +1386,19 @@ namespace QuietClip
             {
                 for (int index = 0; index < _state.Items.Count; index++)
                 {
-                    ClipCard card = new ClipCard(_state.Items[index], index + 1);
+                    ClipEntry item = _state.Items[index];
+                    ClipCard card = new ClipCard(item, index + 1, _selectedEntryIds.Contains(item.Id));
                     card.CopyRequested += delegate(object sender, ClipEntryEventArgs args)
                     {
                         CopyEntry(args.Entry);
+                    };
+                    card.SelectionChanged += delegate(object sender, ClipSelectionEventArgs args)
+                    {
+                        if (args.IsSelected)
+                            _selectedEntryIds.Add(args.Entry.Id);
+                        else
+                            _selectedEntryIds.Remove(args.Entry.Id);
+                        UpdateToolbarState();
                     };
                     _historyPanel.Controls.Add(card);
                 }
@@ -1105,8 +1407,26 @@ namespace QuietClip
             LayoutHistoryItems();
 
             _countLabel.Text = _state.Items.Count + " / " + _state.MaxItems;
-            _copyAllButton.Enabled = _state.Items.Count > 0;
-            _clearButton.Enabled = _state.Items.Count > 0;
+            UpdateToolbarState();
+        }
+
+        private void UpdateToolbarState()
+        {
+            if (_copyAllButton == null || _clearButton == null)
+                return;
+
+            int selectedCount = GetSelectedEntriesInCurrentOrder().Count;
+            bool hasSelection = selectedCount > 0;
+            bool hasItems = _state.Items.Count > 0;
+
+            _copyAllButton.Text = hasSelection ? "复制所选 (" + selectedCount + ")" : "复制全部";
+            _copyAllButton.AccessibleName = hasSelection ?
+                "复制所选的 " + selectedCount + " 条内容" : "复制全部历史内容";
+            _clearButton.Text = hasSelection ? "删除所选" : "清空";
+            _clearButton.AccessibleName = hasSelection ?
+                "删除所选的 " + selectedCount + " 条内容" : "清空全部历史内容";
+            _copyAllButton.Enabled = hasItems;
+            _clearButton.Enabled = hasItems;
         }
 
         private void LayoutHistoryItems()
@@ -1256,6 +1576,8 @@ namespace QuietClip
                     _statusTimer.Dispose();
                 if (_colorMenu != null)
                     _colorMenu.Dispose();
+                if (_headerToolTip != null)
+                    _headerToolTip.Dispose();
                 if (_applicationIcon != null)
                     _applicationIcon.Dispose();
             }

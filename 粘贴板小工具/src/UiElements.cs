@@ -1,6 +1,7 @@
 using System;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.IO;
 using System.Windows.Forms;
 
 namespace QuietClip
@@ -130,6 +131,13 @@ namespace QuietClip
         }
     }
 
+    internal enum RoundButtonIcon
+    {
+        None,
+        Pin,
+        Settings
+    }
+
     internal sealed class RoundButton : Button
     {
         private bool _hovered;
@@ -141,6 +149,7 @@ namespace QuietClip
         public Color TextColor { get; set; }
         public Color BorderColor { get; set; }
         public int Radius { get; set; }
+        public RoundButtonIcon Icon { get; set; }
 
         public RoundButton()
         {
@@ -150,6 +159,7 @@ namespace QuietClip
             TextColor = Theme.Ink;
             BorderColor = Theme.Faint;
             Radius = 9;
+            Icon = RoundButtonIcon.None;
             BackColor = Theme.Canvas;
             FlatStyle = FlatStyle.Flat;
             FlatAppearance.BorderSize = 0;
@@ -206,14 +216,70 @@ namespace QuietClip
             }
 
             Color foreground = Enabled ? TextColor : Theme.Muted;
-            TextRenderer.DrawText(e.Graphics, Text, Font, bounds, foreground,
-                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter |
-                TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix);
+            if (Icon == RoundButtonIcon.None)
+            {
+                TextRenderer.DrawText(e.Graphics, Text, Font, bounds, foreground,
+                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter |
+                    TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix);
+            }
+            else
+            {
+                DrawIcon(e.Graphics, bounds, foreground);
+            }
 
             if (Focused && ShowFocusCues)
             {
                 Rectangle focus = Rectangle.Inflate(bounds, -4, -4);
                 ControlPaint.DrawFocusRectangle(e.Graphics, focus, foreground, Color.Transparent);
+            }
+        }
+
+        private void DrawIcon(Graphics graphics, Rectangle bounds, Color color)
+        {
+            float centerX = bounds.Left + bounds.Width / 2F;
+            float centerY = bounds.Top + bounds.Height / 2F;
+            using (Pen pen = new Pen(color, 1.45F))
+            {
+                pen.StartCap = LineCap.Round;
+                pen.EndCap = LineCap.Round;
+                if (Icon == RoundButtonIcon.Pin)
+                {
+                    PointF[] pinPoints = new PointF[]
+                    {
+                        new PointF(centerX - 3.5F, centerY - 7F),
+                        new PointF(centerX + 3.5F, centerY - 7F),
+                        new PointF(centerX + 3F, centerY - 3F),
+                        new PointF(centerX + 5F, centerY - 1F),
+                        new PointF(centerX + 4F, centerY + 1F),
+                        new PointF(centerX + 1.5F, centerY + 1F),
+                        new PointF(centerX + 1.5F, centerY + 5F),
+                        new PointF(centerX, centerY + 8F),
+                        new PointF(centerX - 1.5F, centerY + 5F),
+                        new PointF(centerX - 1.5F, centerY + 1F),
+                        new PointF(centerX - 4F, centerY + 1F),
+                        new PointF(centerX - 5F, centerY - 1F),
+                        new PointF(centerX - 3F, centerY - 3F)
+                    };
+                    graphics.DrawPolygon(pen, pinPoints);
+                }
+                else if (Icon == RoundButtonIcon.Settings)
+                {
+                    PointF[] gearPoints = new PointF[16];
+                    for (int index = 0; index < gearPoints.Length; index++)
+                    {
+                        double angle = -Math.PI / 2D + index * Math.PI / 8D;
+                        float radius = index % 2 == 0 ? 8F : 6F;
+                        gearPoints[index] = new PointF(
+                            centerX + (float)Math.Cos(angle) * radius,
+                            centerY + (float)Math.Sin(angle) * radius);
+                    }
+                    using (GraphicsPath gear = new GraphicsPath())
+                    {
+                        gear.AddPolygon(gearPoints);
+                        graphics.DrawPath(pen, gear);
+                    }
+                    graphics.DrawEllipse(pen, centerX - 2.25F, centerY - 2.25F, 4.5F, 4.5F);
+                }
             }
         }
     }
@@ -259,26 +325,56 @@ namespace QuietClip
         }
     }
 
+    internal sealed class ClipSelectionEventArgs : EventArgs
+    {
+        public ClipEntry Entry { get; private set; }
+        public bool IsSelected { get; private set; }
+
+        public ClipSelectionEventArgs(ClipEntry entry, bool isSelected)
+        {
+            Entry = entry;
+            IsSelected = isSelected;
+        }
+    }
+
     internal sealed class ClipCard : UserControl
     {
         private readonly ClipEntry _entry;
+        private readonly CheckBox _selectionCheck;
         private readonly Label _numberLabel;
         private readonly Label _timeLabel;
         private readonly Label _contentLabel;
+        private readonly PictureBox _imagePreview;
         private readonly RoundButton _copyButton;
         private readonly Timer _feedbackTimer;
+        private Image _previewImage;
 
         public event EventHandler<ClipEntryEventArgs> CopyRequested;
+        public event EventHandler<ClipSelectionEventArgs> SelectionChanged;
 
-        public ClipCard(ClipEntry entry, int displayNumber)
+        public ClipCard(ClipEntry entry, int displayNumber, bool isSelected)
         {
             _entry = entry;
-            Height = 106;
+            Height = entry.IsImage ? 142 : 106;
             BackColor = Theme.Canvas;
             Margin = new Padding(0, 0, 0, 10);
             Padding = new Padding(0);
             SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint |
                 ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+
+            _selectionCheck = new CheckBox();
+            _selectionCheck.AutoSize = false;
+            _selectionCheck.Size = new Size(22, 22);
+            _selectionCheck.Checked = isSelected;
+            _selectionCheck.Text = String.Empty;
+            _selectionCheck.BackColor = Color.Transparent;
+            _selectionCheck.FlatStyle = FlatStyle.Flat;
+            _selectionCheck.FlatAppearance.BorderColor = Theme.Faint;
+            _selectionCheck.FlatAppearance.CheckedBackColor = Theme.AccentSoft;
+            _selectionCheck.Cursor = Cursors.Hand;
+            _selectionCheck.AccessibleName = "选择第 " + displayNumber + (entry.IsImage ? " 张图片" : " 条内容");
+            _selectionCheck.CheckedChanged += SelectionCheckChanged;
+            Controls.Add(_selectionCheck);
 
             _numberLabel = new Label();
             _numberLabel.AutoSize = false;
@@ -300,13 +396,25 @@ namespace QuietClip
 
             _contentLabel = new Label();
             _contentLabel.AutoSize = false;
-            _contentLabel.Text = BuildPreview(entry.Text);
-            _contentLabel.Font = Theme.Font(9.5F, FontStyle.Regular);
+            _contentLabel.Text = entry.IsImage ? BuildImageDescription(entry) : BuildPreview(entry.Text);
+            _contentLabel.Font = Theme.Font(entry.IsImage ? 8.5F : 9.5F, FontStyle.Regular);
             _contentLabel.ForeColor = Theme.Ink;
             _contentLabel.BackColor = Color.Transparent;
             _contentLabel.AutoEllipsis = true;
             _contentLabel.UseMnemonic = false;
             Controls.Add(_contentLabel);
+
+            if (entry.IsImage)
+            {
+                _imagePreview = new PictureBox();
+                _imagePreview.SizeMode = PictureBoxSizeMode.CenterImage;
+                _imagePreview.BackColor = Theme.Canvas;
+                _imagePreview.BorderStyle = BorderStyle.FixedSingle;
+                _previewImage = CreateThumbnail(entry.ImagePngBase64, 58, 58);
+                _imagePreview.Image = _previewImage;
+                _imagePreview.AccessibleName = "复制的图片缩略图";
+                Controls.Add(_imagePreview);
+            }
 
             _copyButton = new RoundButton();
             _copyButton.Text = "复制";
@@ -337,6 +445,24 @@ namespace QuietClip
             LayoutChildren();
         }
 
+        public ClipEntry Entry
+        {
+            get { return _entry; }
+        }
+
+        public bool IsSelected
+        {
+            get { return _selectionCheck.Checked; }
+        }
+
+        private void SelectionCheckChanged(object sender, EventArgs e)
+        {
+            Invalidate();
+            EventHandler<ClipSelectionEventArgs> handler = SelectionChanged;
+            if (handler != null)
+                handler(this, new ClipSelectionEventArgs(_entry, _selectionCheck.Checked));
+        }
+
         private void CopyButtonClick(object sender, EventArgs e)
         {
             EventHandler<ClipEntryEventArgs> handler = CopyRequested;
@@ -353,10 +479,20 @@ namespace QuietClip
 
         private void LayoutChildren()
         {
-            _numberLabel.SetBounds(22, 15, 30, 18);
-            _timeLabel.SetBounds(55, 15, Math.Max(80, Width - 150), 18);
-            _contentLabel.SetBounds(22, 40, Math.Max(80, Width - 116), 50);
-            _copyButton.Location = new Point(Math.Max(22, Width - 82), 53);
+            _selectionCheck.Location = new Point(22, 12);
+            _numberLabel.SetBounds(49, 15, 30, 18);
+            _timeLabel.SetBounds(82, 15, Math.Max(60, Width - 177), 18);
+            if (_entry.IsImage)
+            {
+                _imagePreview.SetBounds(49, 40, 62, 62);
+                _contentLabel.SetBounds(49, 108, Math.Max(60, Width - 143), 20);
+                _copyButton.Location = new Point(Math.Max(22, Width - 82), 78);
+            }
+            else
+            {
+                _contentLabel.SetBounds(49, 40, Math.Max(60, Width - 143), 50);
+                _copyButton.Location = new Point(Math.Max(22, Width - 82), 53);
+            }
         }
 
         protected override void OnPaint(PaintEventArgs e)
@@ -364,8 +500,9 @@ namespace QuietClip
             e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
             Rectangle bounds = new Rectangle(1, 1, Width - 3, Height - 3);
             using (GraphicsPath path = Theme.RoundedRectangle(bounds, 12))
-            using (SolidBrush brush = new SolidBrush(Theme.Paper))
-            using (Pen border = new Pen(Theme.Faint))
+            using (SolidBrush brush = new SolidBrush(IsSelected ? Theme.AccentSoft : Theme.Paper))
+            using (Pen border = new Pen(IsSelected ? Theme.Accent : Theme.Faint,
+                IsSelected ? 1.5F : 1F))
             {
                 e.Graphics.FillPath(brush, path);
                 e.Graphics.DrawPath(border, path);
@@ -391,6 +528,45 @@ namespace QuietClip
             return trimmed.Substring(0, 320) + "…";
         }
 
+        private static string BuildImageDescription(ClipEntry entry)
+        {
+            if (entry.ImageWidth > 0 && entry.ImageHeight > 0)
+                return "图片 · " + entry.ImageWidth + " × " + entry.ImageHeight;
+            return "图片";
+        }
+
+        private static Image CreateThumbnail(string imagePngBase64, int maximumWidth, int maximumHeight)
+        {
+            if (String.IsNullOrWhiteSpace(imagePngBase64))
+                return null;
+
+            try
+            {
+                byte[] bytes = Convert.FromBase64String(imagePngBase64);
+                using (MemoryStream stream = new MemoryStream(bytes))
+                using (Image original = Image.FromStream(stream))
+                {
+                    float scale = Math.Min((float)maximumWidth / original.Width,
+                        (float)maximumHeight / original.Height);
+                    scale = Math.Min(1F, scale);
+                    int width = Math.Max(1, (int)Math.Round(original.Width * scale));
+                    int height = Math.Max(1, (int)Math.Round(original.Height * scale));
+                    Bitmap thumbnail = new Bitmap(width, height);
+                    using (Graphics graphics = Graphics.FromImage(thumbnail))
+                    {
+                        graphics.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                        graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                        graphics.DrawImage(original, new Rectangle(0, 0, width, height));
+                    }
+                    return thumbnail;
+                }
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
         private static string FormatTime(DateTime value)
         {
             DateTime today = DateTime.Today;
@@ -404,7 +580,11 @@ namespace QuietClip
         protected override void Dispose(bool disposing)
         {
             if (disposing)
+            {
                 _feedbackTimer.Dispose();
+                if (_previewImage != null)
+                    _previewImage.Dispose();
+            }
             base.Dispose(disposing);
         }
     }
